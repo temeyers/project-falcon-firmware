@@ -4,15 +4,20 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <ESPmDNS.h>
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
 #include <math.h>
 #include "mbedtls/md.h"
+#include "mbedtls/sha256.h"
+#include <ArduinoOTA.h>
+#include <Update.h>
+#include "esp_ota_ops.h"
+#include "secrets.h"   // before config.h so config.h #ifndef fallbacks (OTA_PASS) see the real values
 #include "config.h"
 #ifdef BOARD_M5STICKS3
 #include <M5Unified.h>
 #endif
-#include "secrets.h"
 
 Preferences prefs;
 #ifdef SLEEP_ENABLED
@@ -597,7 +602,9 @@ void localArmToggle(uint32_t now) {
   Serial.printf("[BTN] %s (local, waiting for server ack)\n", armed ? "ARMED" : "disarmed");
   queueEvent(pendingLocalType);
 }
+void otaOffer(const String& r);
 void handleReply(const String& r) {
+  otaOffer(r);
   // {"ok":true,"c":N,"a":0|1,"cmds":[{"cmdId":N,"type":"arm","arg":N}]} - tiny parser, no JSON lib
   if (pendingLocalArm && millis() - pendingLocalAt > LOCAL_ARM_PENDING_MAX_MS) { pendingLocalArm = false; Serial.println("[ARM] local toggle never acked; following server"); }
   { int hp = r.indexOf("\"hb\":"); if (hp >= 0) { long v = r.substring(hp+5).toInt();
@@ -658,14 +665,34 @@ void backoff(uint32_t ms) {
   Serial.printf("[HTTP] backing off %lu ms\n", (unsigned long)txBackoffMs);
 }
 
+
+// ---------- server address cache: resolve .local once, re-resolve only after a failed post ----------
+IPAddress srvIp; bool srvIpOk = false; bool mdnsUp = false;
+String srvUrl() {
+  String u = String(SERVER_URL);
+  if (u.startsWith("https")) return u;   // TLS keeps the hostname (cert/SNI)
+  int hs = u.indexOf("://") + 3, he = u.indexOf(':', hs); int sl = u.indexOf('/', hs);
+  if (he < 0 || (sl >= 0 && sl < he)) he = sl < 0 ? u.length() : sl;
+  String host = u.substring(hs, he);
+  if (!srvIpOk) {
+    uint32_t t0 = millis(); IPAddress ip;
+    if (host.endsWith(".local")) { if (!mdnsUp) mdnsUp = MDNS.begin(DEVICE_ID); ip = MDNS.queryHost(host.substring(0, host.length()-6), 2000); }
+    else WiFi.hostByName(host.c_str(), ip);
+    uint32_t dt = millis() - t0;
+    if (ip == IPAddress(0,0,0,0)) { Serial.printf("[DNS] resolve %s FAILED after %lums\n", host.c_str(), (unsigned long)dt); return u; }
+    srvIp = ip; srvIpOk = true; Serial.printf("[DNS] %s -> %s in %lums (cached)\n", host.c_str(), ip.toString().c_str(), (unsigned long)dt);
+  }
+  return u.substring(0, hs) + srvIp.toString() + u.substring(he);
+}
 // returns true if delivered (or permanently rejected) -> dequeue
 uint32_t curEvArg = 0;
+void otaPostOk();
 bool postEvent(const char* type) {
   if (WiFi.status() != WL_CONNECTED) return false;
   uint32_t c = counter + 1;
   uint16_t ack = ackEmpty() ? 0 : ackq[ackHead];
   String body = String("{\"c\":") + c + ",\"t\":\"" + type + "\",\"v\":" + PROTOCOL_VERSION +
-                ",\"r\":" + WiFi.RSSI() + ",\"up\":" + (millis()/1000) + ",\"f\":" + currentFlags();
+                ",\"r\":" + WiFi.RSSI() + ",\"up\":" + (millis()/1000) + ",\"f\":" + currentFlags() + ",\"fwv\":\"" FW_VERSION "\",\"fwb\":\"" FW_BUILD "\"";
 #ifdef NET_CELL
   body += ",\"net\":\"cell\"";
 #else
@@ -680,22 +707,31 @@ bool postEvent(const char* type) {
   if (ack) body += String(",\"ack\":") + ack;
   if (curEvArg) body += String(",\"el\":") + curEvArg;   // cycle_stalled: seconds since cycle start
   body += "}";   // battery fields (bv/bp) omitted = null: USB powered
-  String url = String(SERVER_URL) + "/v1/ingest";
+  int code = -1; String resp, ra;
+  for (int attempt = 0; attempt < 2; attempt++) {   // one retry on a network failure
+  String url = srvUrl() + "/v1/ingest";
 #ifdef SLEEP_ENABLED
   static HTTPClient http; static WiFiClient plain; static WiFiClientSecure tls; http.setReuse(true);   // keep-alive within a wake
 #else
   HTTPClient http; WiFiClient plain; WiFiClientSecure tls;
 #endif
+  uint32_t t0 = millis();
   if (url.startsWith("https")) { if (strlen(SERVER_CA_PEM)) tls.setCACert(SERVER_CA_PEM); else tls.setInsecure(); http.begin(tls, url); }
   else http.begin(plain, url);
-  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.setConnectTimeout(HTTP_TIMEOUT_MS); http.setTimeout(HTTP_TIMEOUT_MS);
   const char* hdrs[] = {"Retry-After"}; http.collectHeaders(hdrs, 1);
   http.addHeader("content-type", "application/json");
   http.addHeader("x-device-id", DEVICE_ID);
   http.addHeader("x-signature", hmacHex(body));
-  int code = http.POST(body); String resp = http.getString(); String ra = http.header("Retry-After"); http.end();
+  code = http.POST(body); resp = http.getString(); ra = http.header("Retry-After"); http.end();
+  uint32_t dt = millis() - t0;
+  if (code <= 0 || dt > HTTP_SLOW_MS) Serial.printf("[HTTP] %s %s try %d: code %d in %lums\n", code <= 0 ? "FAIL" : "SLOW", type, attempt + 1, code, (unsigned long)dt);
+  if (code > 0) break;
+  srvIpOk = false;   // re-resolve before the retry
+  }
   Serial.printf("[HTTP] %s -> %d %s\n", body.c_str(), code, resp.c_str());
   if (code == 200) {
+    otaPostOk();
     counter = c; prefs.putUInt("ctr", counter); if (sentUnl) unlPending = false; if (sentSnd) sndFlag = false;
     int ci = resp.indexOf("\"c\":");
     if (ci < 0 || (uint32_t)resp.substring(ci+4).toInt() != c) { Serial.println("[HTTP] WARN reply counter mismatch; ignoring cmds (hb still applied)");
@@ -717,6 +753,155 @@ bool postEvent(const char* type) {
   return false;
 }
 
+
+// ---------- OTA: LAN (ArduinoOTA) + server-driven HTTP(S) with SHA-256 + rollback ----------
+// Rollback: the prebuilt Arduino-ESP32 bootloader has CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y. We override
+// verifyRollbackLater() so the core does NOT auto-confirm a fresh image at boot; it stays PENDING_VERIFY until the
+// first 200 from the server (otaPostOk). No 200 within OTA_VERIFY_MS -> mark invalid + reboot -> bootloader boots the
+// old slot. A crash/reset before confirmation also rolls back (bootloader marks a PENDING_VERIFY image ABORTED).
+extern "C" bool verifyRollbackLater() { return true; }
+bool otaPendingVerify = false, otaBusy = false, otaLanUp = false;
+String otaWantV, otaWantUrl, otaWantSha; uint32_t otaLastTry = 0; bool otaTried = false;
+bool usbPower() {
+#ifdef BOARD_M5STICKS3
+  return M5.Power.getVBUSVoltage() > 4300;   // -1 if the PMIC can't report -> treated as battery
+#else
+  return false;
+#endif
+}
+void otaScreen(const char* msg) {
+#ifdef BOARD_M5STICKS3
+  M5.Display.wakeup(); M5.Display.setBrightness(DISPLAY_BRIGHTNESS); M5.Display.fillScreen(0x0000);
+  M5.Display.setTextColor(0xFFFF, 0x0000); M5.Display.setTextDatum(middle_center); M5.Display.setTextSize(2);
+  M5.Display.drawString(msg, M5.Display.width()/2, M5.Display.height()/2);
+#endif
+  Serial.printf("[OTA] %s\n", msg);
+}
+void otaQuiet() {   // stop siren + any sound before flashing
+  alarmStop("alarm_disarm"); nsOn = false;
+#ifdef BOARD_M5STICKS3
+  spkReady(); M5.Speaker.stop();   // also releases the mic (shared ES8311)
+#endif
+}
+String jStr(const String& o, const char* k) {
+  String key = String("\"") + k + "\":"; int i = o.indexOf(key); if (i < 0) return "";
+  i += key.length(); while (i < (int)o.length() && o[i] == ' ') i++; if (o[i] != '"') return "";
+  int e = i + 1; while (e < (int)o.length() && !(o[e] == '"' && o[e-1] != '\\')) e++;
+  String v = o.substring(i + 1, e); v.replace("\\/", "/"); return v;
+}
+void otaOffer(const String& r) {
+  int f = r.indexOf("\"fw\":"); if (f < 0) return;
+  int b = r.indexOf('{', f); if (b < 0 || b > f + 8) return;
+  int e = r.indexOf('}', b); if (e < 0) return;
+  String o = r.substring(b, e + 1);
+  String v = jStr(o, "v"), url = jStr(o, "url"), sha = jStr(o, "sha256"); sha.toLowerCase();
+  bool hex = sha.length() == 64; for (int i = 0; hex && i < 64; i++) hex = isxdigit((unsigned char)sha[i]);
+  if (!v.length() || v == FW_VERSION || !url.startsWith("http") || !hex) { if (v.length() && v != FW_VERSION) Serial.println("[OTA] fw offer ignored: bad url/sha256"); return; }
+  if (v != otaWantV) { otaWantV = v; otaTried = false; Serial.printf("[OTA] server offers %s (running %s)\n", v.c_str(), FW_VERSION); }
+  otaWantUrl = url; otaWantSha = sha;
+}
+const char* otaBlocked() {
+  if (armed) return "armed"; if (sirenAllowed) return "sirenAllowed"; if (alSt == AL_SOUNDING) return "alarm";
+  if (runSt != IDLE) return "running"; if (machineState == 1) return "guarded"; if (otaPendingVerify) return "unverified";
+#ifdef SLEEP_ENABLED
+  if (!usbPower()) return "battery";   // battery build: USB power only (undetectable VBUS reads as battery)
+#endif
+  if (WiFi.status() != WL_CONNECTED) return "offline";
+  return nullptr;
+}
+void otaFail(uint8_t reason, const char* why) {
+  uint8_t n = prefs.getUChar("ota_n", 0) + 1; prefs.putUChar("ota_n", n);
+  Serial.printf("[OTA] FAIL %s (reason %u, fail %u/%d for %s)\n", why, reason, n, OTA_MAX_FAILS, otaWantV.c_str());
+  queueEventArg("ota_fail", reason); otaBusy = false;
+#ifdef BOARD_M5STICKS3
+  showState(true);
+#endif
+}
+// reasons: 1 http, 2 size/begin, 3 write/stream, 4 sha256 mismatch, 5 end/boot set, 6 new image rolled back
+void otaRun() {
+  otaLastTry = millis(); otaTried = true;
+  if (prefs.getString("ota_v", "") != otaWantV) { prefs.putString("ota_v", otaWantV); prefs.putUChar("ota_n", 0); }
+  { uint32_t sa = curEvArg; curEvArg = 0; bool ok = postEvent("ota_start"); curEvArg = sa; Serial.printf("[OTA] ota_start %s\n", ok ? "sent" : "not delivered"); }   // sent now: the download blocks the loop
+  otaBusy = true; otaQuiet(); otaScreen("UPDATING");
+  HTTPClient http; WiFiClient plain; WiFiClientSecure tls;
+  if (otaWantUrl.startsWith("https")) { if (strlen(SERVER_CA_PEM)) tls.setCACert(SERVER_CA_PEM); else tls.setInsecure(); http.begin(tls, otaWantUrl); }
+  else http.begin(plain, otaWantUrl);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS); http.setConnectTimeout(HTTP_TIMEOUT_MS); http.setTimeout(15000);
+  int code = http.GET();
+  if (code != 200) { http.end(); otaFail(1, "http"); return; }
+  int len = http.getSize();
+  if (!Update.begin(len > 0 ? (size_t)len : UPDATE_SIZE_UNKNOWN, U_FLASH)) { http.end(); otaFail(2, Update.errorString()); return; }
+  mbedtls_sha256_context sc; mbedtls_sha256_init(&sc); mbedtls_sha256_starts(&sc, 0);
+  WiFiClient* st = http.getStreamPtr(); static uint8_t buf[2048]; size_t got = 0; uint32_t lastData = millis();
+  while (http.connected() && (len <= 0 || got < (size_t)len)) {
+    size_t a = st->available();
+    if (!a) { if (millis() - lastData > 15000) break; delay(2); continue; }
+    int n = st->readBytes(buf, a > sizeof(buf) ? sizeof(buf) : a); if (n <= 0) continue;
+    lastData = millis(); mbedtls_sha256_update(&sc, buf, n);
+    if (Update.write(buf, n) != (size_t)n) { mbedtls_sha256_free(&sc); Update.abort(); http.end(); otaFail(3, "write"); return; }
+    got += n;
+  }
+  http.end();
+  uint8_t h[32]; mbedtls_sha256_finish(&sc, h); mbedtls_sha256_free(&sc);
+  if (len > 0 && got != (size_t)len) { Update.abort(); otaFail(3, "short read"); return; }
+  char hx[65]; for (int i = 0; i < 32; i++) sprintf(hx + 2*i, "%02x", h[i]);
+  if (otaWantSha != hx) { Update.abort(); Serial.printf("[OTA] sha256 got %s want %s\n", hx, otaWantSha.c_str()); otaFail(4, "sha256 mismatch"); return; }
+  if (!Update.end(true)) { otaFail(5, Update.errorString()); return; }   // sets the boot partition only after the hash matched
+  prefs.putString("ota_new", otaWantV); prefs.putUChar("ota_n", 0);
+  Serial.printf("[OTA] %u bytes ok, sha256 verified -> reboot into %s\n", (unsigned)got, otaWantV.c_str()); otaScreen("REBOOTING"); delay(300); ESP.restart();
+}
+void otaPostOk() {
+  if (!otaPendingVerify) return;
+  esp_ota_mark_app_valid_cancel_rollback(); otaPendingVerify = false; prefs.remove("ota_new");
+  Serial.printf("[OTA] image %s confirmed valid (first 200)\n", FW_VERSION); queueEvent("ota_ok");
+}
+void otaBoot() {
+  esp_ota_img_states_t s; const esp_partition_t* run = esp_ota_get_running_partition();
+  otaPendingVerify = run && esp_ota_get_state_partition(run, &s) == ESP_OK && s == ESP_OTA_IMG_PENDING_VERIFY;
+  String nv = prefs.getString("ota_new", "");
+  if (!otaPendingVerify && nv.length() && nv != FW_VERSION) {   // we flashed nv, but we're running the old image: it rolled back
+    prefs.remove("ota_new"); otaWantV = nv; prefs.putUChar("ota_n", prefs.getUChar("ota_n", 0) + 1); otaTried = true; otaLastTry = millis();
+    Serial.printf("[OTA] %s rolled back, still on %s\n", nv.c_str(), FW_VERSION); queueEventArg("ota_fail", 6); }
+  else if (!otaPendingVerify && nv.length()) prefs.remove("ota_new");
+  if (otaPendingVerify) Serial.printf("[OTA] new image %s pending verify (needs a 200 within %lus)\n", FW_VERSION, OTA_VERIFY_MS/1000);
+}
+String otaHost() { String h = "falcon-"; for (const char* p = DEVICE_ID; *p; p++) { char c = tolower((unsigned char)*p); if (isalnum((unsigned char)c) || c == '-') h += c; } return h; }
+void otaLanTick() {
+  static bool warned = false;
+  if (!strlen(OTA_PASS)) { if (!warned) { warned = true; Serial.println("[OTA] WARN OTA_PASS not set in secrets.h: LAN OTA disabled"); } return; }
+  bool want = WiFi.status() == WL_CONNECTED;
+#ifdef SLEEP_ENABLED
+  want = want && usbPower();   // battery build: LAN OTA only while awake and on USB
+#endif
+  if (want && !otaLanUp) {
+    String h = otaHost(); ArduinoOTA.setHostname(h.c_str()); ArduinoOTA.setPassword(OTA_PASS); ArduinoOTA.setPort(OTA_LAN_PORT);
+    ArduinoOTA.setMdnsEnabled(false); ArduinoOTA.setRebootOnSuccess(true);
+    ArduinoOTA.onStart([]() { otaBusy = true; otaQuiet(); otaScreen("UPDATING"); });
+    ArduinoOTA.onEnd([]() { otaScreen("REBOOTING"); });
+    ArduinoOTA.onError([](ota_error_t e) { otaBusy = false; Serial.printf("[OTA] LAN error %u\n", e);
+#ifdef BOARD_M5STICKS3
+      showState(true);
+#endif
+    });
+    ArduinoOTA.begin();
+    if (!mdnsUp) mdnsUp = MDNS.begin(h.c_str());
+    if (mdnsUp) MDNS.enableArduino(OTA_LAN_PORT, true);
+    otaLanUp = true; Serial.printf("[OTA] LAN OTA up: %s @ %s:%d\n", h.c_str(), WiFi.localIP().toString().c_str(), OTA_LAN_PORT);
+  } else if (!want && otaLanUp) { ArduinoOTA.end(); otaLanUp = false; Serial.println("[OTA] LAN OTA stopped"); }
+  if (otaLanUp) ArduinoOTA.handle();
+}
+void otaTick() {
+  otaLanTick();
+  if (otaPendingVerify && millis() > OTA_VERIFY_MS) {
+    Serial.println("[OTA] no server 200 within verify window -> rollback"); delay(200); esp_ota_mark_app_invalid_rollback_and_reboot(); }
+  if (!otaWantV.length() || otaWantV == FW_VERSION || otaBusy) return;
+  if (prefs.getString("ota_v", "") == otaWantV && prefs.getUChar("ota_n", 0) >= OTA_MAX_FAILS) return;   // gave up on this version
+  if (otaTried && millis() - otaLastTry < OTA_RETRY_MS) return;
+  static uint32_t lastLog = 0; const char* why = otaBlocked();
+  if (why) { if (millis() - lastLog > 60000) { lastLog = millis(); Serial.printf("[OTA] %s waiting: %s\n", otaWantV.c_str(), why); } return; }
+  otaRun();
+}
+
 // ---------- serial console ----------
 void serialCmd(String l) {
   l.trim(); if (!l.length()) return;
@@ -734,6 +919,11 @@ void serialCmd(String l) {
   else if (l == "sndlearn") { memset(&sndLearn, 0, sizeof(sndLearn)); segN = 0; curBin = -1; lowRunMs = 0; memset(lowHist, 0, sizeof(lowHist)); sndLearnUntil = millis() + 12000;
     Serial.println("[SND] learning for 12 s: play the machine's done chime now"); }
   else if (l == "sndforget") { memset(&sndFp, 0, sizeof(sndFp)); prefs.remove("snd_fp"); Serial.println("[SND] fingerprint cleared (generic rules)"); }
+  else if (l == "ota") { esp_ota_img_states_t st; const esp_partition_t* rp = esp_ota_get_running_partition(); const esp_partition_t* np = esp_ota_get_next_update_partition(NULL);
+    bool hs = rp && esp_ota_get_state_partition(rp, &st) == ESP_OK;
+    Serial.printf("fw %s run=%s@0x%lx state=%s next=%s pendingVerify=%d lan=%d(%s) offer=%s fails=%u blocked=%s\n", FW_VERSION, rp ? rp->label : "?", rp ? (unsigned long)rp->address : 0UL,
+      !hs ? "n/a" : st == ESP_OTA_IMG_VALID ? "valid" : st == ESP_OTA_IMG_PENDING_VERIFY ? "pending_verify" : st == ESP_OTA_IMG_NEW ? "new" : st == ESP_OTA_IMG_UNDEFINED ? "undefined" : "invalid/aborted",
+      np ? np->label : "?", otaPendingVerify, otaLanUp, otaHost().c_str(), otaWantV.length() ? otaWantV.c_str() : "-", prefs.getUChar("ota_n", 0), otaBlocked() ? otaBlocked() : "no"); }
   else if (l == "calstat") Serial.printf("cal:%d ang=%.1f max=%.1f\n", calOk?1:0, angle, T.runMaxDeg);
   else if (l == "log on") { logOn = true; Serial.println("H,t_ms,ax,ay,az,gx,gy,gz,run,open,armed,rms   # L=sample M=mark E=event"); }
   else if (l == "log off") logOn = false;
@@ -879,7 +1069,7 @@ void setup() {
 #else
   delay(1500);
 #endif
-  Serial.println("\nProject Falcon sensor fw 0.2 (USB, JSON /v1/ingest)");
+  Serial.println("\nProject Falcon sensor fw " FW_VERSION " (JSON /v1/ingest)");
   prefs.begin("falcon", false);
   counter = prefs.getUInt("ctr", 0);
   if (prefs.isKey("ack")) { ackPush(prefs.getInt("ack", 0)); prefs.remove("ack"); }  // reboot command ack
@@ -888,6 +1078,7 @@ void setup() {
   hbSec = prefs.getUInt("hb_s", HB_DEFAULT_S); sirenMode = prefs.getUChar("siren_m", 1); if (sirenMode > 2) sirenMode = 1;
   machineState = 0;   // cold boot: never restore GUARDED/DONE from flash; first server reply (st) decides
   doneAtS = prefs.getLong64("done_t", 0); if (doneAtS > clkS()) doneAtS = clkS();   // clock reset by reboot: restart count
+  otaBoot();
   calOk = prefs.getBool("cal_ok", true); tiltOn = prefs.getBool("tilt", false);
   pinMode(PIN_BOOT_BTN, BTN_PULL);
   // user reset: button held for 10 s from power-up wipes Wi-Fi creds + tuning; counter (ctr) is kept, ownership stays on the server
@@ -961,6 +1152,7 @@ void loop() {
     btnDown = 0; }
 #endif
 
+  otaTick();
   alarmTick(now);
   if (resyncPending) { resyncPending = false; Serial.println("[NET] (re)connected: resync st/a"); queueEvent("heartbeat"); }
   sndTick(now);
@@ -991,7 +1183,9 @@ void loop() {
 #else
   wifiConnect();
 #endif
-  if (now - lastHb >= hbSec * 1000UL) { lastHb = now; queueEvent("heartbeat"); }
+  { static uint32_t lastLoop = 0; if (lastLoop && now - lastLoop > 1000) Serial.printf("[LOOP] stalled %lums\n", (unsigned long)(now - lastLoop)); lastLoop = millis(); }
+  if (now - lastHb >= hbSec * 1000UL) { lastHb = now; bool q = false; for (int i = evHead; i != evTail; i = (i + 1) % EVENT_QUEUE_LEN) if (!strcmp(evq[i], "heartbeat")) q = true;
+    if (!q) queueEvent("heartbeat"); else Serial.println("[HB] previous heartbeat still queued (post backlog)"); }
   if (evHead == evTail && !ackEmpty()) queueEvent("ack");      // flush remaining acks, one per message
   if (evHead != evTail && now - lastTx >= MIN_TX_INTERVAL_MS && (int32_t)(now - nextTxAt) >= 0) {
     lastTx = now;
@@ -1000,6 +1194,6 @@ void loop() {
   }
   static String line; while (Serial.available()) { char ch = Serial.read(); if (ch == '\n') { serialCmd(line); line = ""; } else if (ch != '\r') line += ch; }
 #ifdef SLEEP_ENABLED
-  sleepTick(millis(), rms > T.quietRms || jerk > T.movedJerk * 0.5f || streamOn || logOn || line.length());
+  sleepTick(millis(), rms > T.quietRms || jerk > T.movedJerk * 0.5f || streamOn || logOn || line.length() || otaPendingVerify || otaLanUp);
 #endif
 }

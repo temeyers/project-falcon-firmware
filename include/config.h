@@ -67,7 +67,8 @@
 #define HB_DEFAULT_S       900
 #endif
 #define MIN_TX_INTERVAL_MS 2000   // max 1 message / 2 s
-#define HTTP_TIMEOUT_MS    8000
+#define HTTP_TIMEOUT_MS    5000   // connect + read cap (was 8 s); one retry
+#define HTTP_SLOW_MS       2000   // log posts slower than this
 #define PROTOCOL_VERSION   3
 #define EVENT_QUEUE_LEN    16
 
@@ -143,3 +144,18 @@
 #define RUN_MAX_RMS 0.60f   // g: above this during the hold = hand handling/pickup, not a machine (estimate, tune)
 #define TILT_OPEN_DEG_DEF 20.0f
 #define TILT_CLOSE_DEG_DEF 10.0f
+
+// ---- Firmware version / OTA ----
+#ifdef SLEEP_ENABLED
+#define FW_BUILD "bat"
+#else
+#define FW_BUILD "usb"
+#endif
+#define FW_VERSION "0.9.0"          // reported as "fwv" in every post; server-driven OTA compares against this
+#ifndef OTA_PASS
+#define OTA_PASS ""                 // define OTA_PASS in secrets.h; empty => LAN OTA (ArduinoOTA) disabled with a serial warning
+#endif
+#define OTA_VERIFY_MS      300000UL // new image must get a 200 from the server within 5 min or it rolls back
+#define OTA_RETRY_MS       3600000UL// same version retried at most once per hour
+#define OTA_MAX_FAILS      3        // then give up until the server offers a different version
+#define OTA_LAN_PORT       3232
